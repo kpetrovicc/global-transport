@@ -44,7 +44,7 @@ DATA_DIR/
   images/   00000/img00000000.png ...            dataset.json    # 256x256 images (only for REPA and caption checks)
 ```
 
-* **ImageNet-256 latents and images**: either download the already converted dataset (~295 GB of archives from [Yuehao/imagenet-1k-256](https://huggingface.co/datasets/Yuehao/imagenet-1k-256)) with [scripts/data/download_imagenet256.sh](scripts/data/download_imagenet256.sh) after setting `DATA_DIR` in the script, or convert ImageNet yourself following the [preprocessing guide](preprocessing/README.md).
+* **ImageNet-256 latents and images**: we recommend to download the already converted dataset (~295 GB of archives from [Yuehao/imagenet-1k-256](https://huggingface.co/datasets/Yuehao/imagenet-1k-256)) with [scripts/data/download_imagenet256.sh](scripts/data/download_imagenet256.sh) after setting `DATA_DIR` in the script, otherwise one can also convert ImageNet following the [preprocessing guide](preprocessing/README.md) as mentioned DMF repo.
 * **Reference statistics for FID / FD-DINOv2** (`imgnet256.pkl`, 42 MB) from the [DMF Huggingface repository](https://huggingface.co/kyungmnlee/DMF), downloaded once into `ckpt/` where the evaluation scripts expect them:
   ```bash
   pip install huggingface_hub
@@ -91,18 +91,15 @@ pip install torch==2.8.0 torchvision==0.23.0
 pip install -r requirements.txt
 ```
 
-The launch scripts live in [scripts/data/](scripts/data/) (dataset and caption preparation), [scripts/train/](scripts/train/) (flow models, flow maps, continuous conditions) and [scripts/eval/](scripts/eval/) (CFG sweeps with FID / FD-DINOv2). Run them from the repository root, e.g. `sh scripts/train/train_sit_b_2_256_ot.sh`.
+The launch scripts live in [scripts/data/](scripts/data/) (dataset and caption preparation), [scripts/train/](scripts/train/) (training scripts) and [scripts/eval/](scripts/eval/) (computing FID and FD-DINOv2 across CFG scales). Run them from the repository root, e.g. `sh scripts/train/train_sit_b_2_256_ot.sh`.
 
-On Hopper GPUs (H100, H200, H800) we recommend CUDA 12.8 with [Flash Attention v3](https://github.com/Dao-AILab/flash-attention?tab=readme-ov-file#flashattention-3-beta-release) (`--attn-func fa3`, install from source); on Ampere GPUs (A100) use [Flash-Attention v2](https://github.com/Dao-AILab/flash-attention?tab=readme-ov-file#installation-and-features) (`--attn-func fa2`). Flash-Attention provides the forward-mode JVP that the DMF loss needs; `--attn-func base` works everywhere but is slower. Alternatively, `uv sync --frozen` installs the pinned environment of `pyproject.toml` / `uv.lock` (with prebuilt flash-attn wheels) into `.venv`. Training logs to [Weights & Biases](https://wandb.ai): run `wandb login` once, or set `WANDB_MODE=offline`.
-
-### Train flow models (SiT)
-
-One script per model scale, each training with the Global Transport coupling: [scripts/train/train_sit_b_2_256_ot.sh](scripts/train/train_sit_b_2_256_ot.sh), [scripts/train/train_sit_l_2_256_ot.sh](scripts/train/train_sit_l_2_256_ot.sh) and [scripts/train/train_sit_xl_2_256_ot.sh](scripts/train/train_sit_xl_2_256_ot.sh). Fill in `DATA_DIR`, `OUTPUT_DIR` and the W&B settings at the top of the script. All runs train for 800k steps at global batch 256 on 8 GPUs, without REPA:
+One script per model scale, each training with the Global Transport coupling: [scripts/train/train_sit_b_2_256_ot.sh](scripts/train/train_sit_b_2_256_ot.sh), [scripts/train/train_sit_l_2_256_ot.sh](scripts/train/train_sit_l_2_256_ot.sh) and [scripts/train/train_sit_xl_2_256_ot.sh](scripts/train/train_sit_xl_2_256_ot.sh). Fill in `DATA_DIR`, `OUTPUT_DIR` and the W&B settings at the top of the script. All SiT runs (B/2, L/2, XL/2) train for 800k steps at a batch size of 256, without REPA. We trained our models on a single GPU. 
 
 ```bash
 accelerate launch train_fm.py \
   --model "SiT-B/2" \
   --attn-func "fa3" \
+  --mixed-precision "bf16" \
   --P-mean 0.0 \
   --proj-coeff 0 \
   --max-train-steps 800000 \
@@ -111,7 +108,7 @@ accelerate launch train_fm.py \
 
 Checkpoints are written every 50k steps to `OUTPUT_DIR/EXP_NAME/checkpoints/<step>.pt` (EMA and raw weights). To change the setup, edit the flags in the script:
 
-- **Coupling**: remove `--use-ot` for the independent coupling, or replace it by `--use-ccot` for class-conditional OT (needs class labels, so it cannot be combined with `--cond-file`). The two flags are mutually exclusive.
+- **Coupling**: remove `--use-ot` for the independent coupling, or replace it by `--use-ccot` for class-conditional OT.
 - **Batch size and GPUs**: `--batch-size` (default 256) is the global batch and hence the size of the transport plan; `--num_processes` of `accelerate launch` sets the number of GPUs it is split over, so changing the GPU count does not change the coupling. Set `--num_processes 1` and drop `--multi_gpu` for a single GPU.
 - `--model`: `[SiT-B/2, SiT-L/2, SiT-XL/2]`
 - `--attn-func`: `["fa3", "fa2", "torch_sdpa", "base"]`
@@ -122,7 +119,7 @@ Checkpoints are written every 50k steps to `OUTPUT_DIR/EXP_NAME/checkpoints/<ste
 
 ### Train flow maps (DMF)
 
-DMF fine-tunes a trained flow model into a flow map that predicts average velocities, so 1-4 sampling steps suffice. Start from the SiT checkpoint of the **same scale and coupling** (`PRETRAINED_CKPT` in the script), see [scripts/train/train_dmf_b_2_256_ot.sh](scripts/train/train_dmf_b_2_256_ot.sh), [scripts/train/train_dmf_l_2_256_ot.sh](scripts/train/train_dmf_l_2_256_ot.sh) and [scripts/train/train_dmf_xl_2_256_ot.sh](scripts/train/train_dmf_xl_2_256_ot.sh). All runs train for 400k steps at global batch 256 on 8 GPUs with model guidance:
+We use DMF to fine-tune pretrained SiT flow matching models into a flow map to enable one- to few-step generation. Start from the SiT checkpoint (`PRETRAINED_CKPT` in the script), see [scripts/train/train_dmf_b_2_256_ot.sh](scripts/train/train_dmf_b_2_256_ot.sh), [scripts/train/train_dmf_l_2_256_ot.sh](scripts/train/train_dmf_l_2_256_ot.sh) and [scripts/train/train_dmf_xl_2_256_ot.sh](scripts/train/train_dmf_xl_2_256_ot.sh). DMF-B/2 run trains for 400k steps at global batch 256 on 1 GPU with model guidance. We train DMF-L/2 model on GPU and with gradient accumulation. 
 
 ```bash
 accelerate launch train_dmf.py \
@@ -155,7 +152,7 @@ accelerate launch train_dmf.py \
 
 ### Train with continuous conditions
 
-[scripts/train/train_sit_cont_b_2_256_ot.sh](scripts/train/train_sit_cont_b_2_256_ot.sh) trains SiT-B/2 on the caption embeddings instead of class labels (`--cond-file COND_FILE --cond-dim 1024`); classifier-free guidance drops the condition to the zero vector. Remove `--use-ot` for the independent coupling (class-conditional OT needs class labels). The other parameters are those of the flow models.
+[scripts/train/train_sit_cont_b_2_256_ot.sh](scripts/train/train_sit_cont_b_2_256_ot.sh) trains SiT-B/2 on the caption embeddings instead of class labels (`--cond-file COND_FILE --cond-dim 1024`); classifier-free guidance drops the condition to the zero vector. Remove `--use-ot` for the independent coupling. The other parameters are those of the flow models.
 
 To sample from such a model, pass the validation caption embeddings to `generate.py` (`--cond-file PATH/TO/val_text_emb_dfn5b.npy --cond-dim 1024`): image `k` is generated from row `k % 50000` of the file, so the png index identifies its caption.
 
@@ -167,7 +164,7 @@ One script per model, each a plain classifier-free-guidance sweep that samples 5
 - [scripts/eval/eval_dmf_b_2_256.sh](scripts/eval/eval_dmf_b_2_256.sh), [scripts/eval/eval_dmf_l_2_256.sh](scripts/eval/eval_dmf_l_2_256.sh), [scripts/eval/eval_dmf_xl_2_256.sh](scripts/eval/eval_dmf_xl_2_256.sh): flow maps, 1 / 2 / 4 Euler steps, no CFG (the guidance is trained in)
 - [scripts/eval/eval_sit_cont_b_2_256.sh](scripts/eval/eval_sit_cont_b_2_256.sh): the continuous-condition model, 64 Euler steps × CFG scales 1.0-10.0, conditioned on the validation caption embeddings (`COND_FILE`)
 
-The same coupling-agnostic scripts evaluate independent, Global Transport and class-conditional OT checkpoints; only `CKPT_DIR` changes. The commands they run are, for a flow model:
+The same coupling-agnostic scripts evaluate independent, Global Transport and class-conditional OT checkpoints; only `CKPT_DIR` changes. The commands for SiT model are:
 
 ```bash
 torchrun --nnodes=1 --nproc_per_node=8 generate.py \
@@ -184,7 +181,7 @@ torchrun --nnodes=1 --nproc_per_node=8 generate.py \
   --global-seed 3
 ```
 
-Flow maps are sampled with 1, 2 or 4 steps and no classifier-free guidance (the guidance is trained in):
+Flow maps are sampled with 1, 2 or 4 steps. The command for DMF model is:
 
 ```bash
 torchrun --nnodes=1 --nproc_per_node=8 generate.py \
@@ -217,13 +214,6 @@ python calculate_metrics.py calc \
 ### Toy example: couplings and guidance on a 40-mode Gaussian mixture
 
 [examples/fab4_notebook.ipynb](examples/fab4_notebook.ipynb) trains small conditional flow models on a 2-D 40-mode mixture with the three couplings, using the same `OTPlanSampler` as the ImageNet trainers, and plots samples across guidance scales, sampling trajectories, velocity-field heatmaps, divergence maps and the guidance-norm integral. It runs on CPU in a few minutes.
-
-### Tests
-
-```bash
-python -m pytest tests/ -v                                                      # CPU, no flash-attn needed
-accelerate launch --multi_gpu --num_processes 2 tests/ddp_ot_equivalence.py     # global OT / CCOT plans == single-process plans
-```
 
 ## Contributions
 
